@@ -1,0 +1,21 @@
+services:
+  - type: worker
+    name: cafe-booking-bot
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_USER_ID
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: MENU_URL
+        sync: false
+      - key: STAFF_USER_IDS
+        sync: false
