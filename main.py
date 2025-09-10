@@ -21,6 +21,20 @@ from aiogram.types import ForceReply
 from aiogram.filters import StateFilter
 from aiogram.types import ChatMemberUpdated
 from aiogram.exceptions import TelegramBadRequest
+import os
+from aiohttp import web
+
+async def _health(_):
+    return web.Response(text="ok")
+
+async def start_http_server():
+    app = web.Application()
+    app.add_routes([web.get("/", _health), web.get("/healthz", _health)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", "8000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
 
 
 # ============================= I18N (тексты на 3 языках) =============================
@@ -1105,7 +1119,14 @@ async def main():
     if ADMIN_CHAT_ID:
         await set_chat_admin_commands(bot, ADMIN_CHAT_ID, "ru")
 
+
+
     logger.info("Bot started")
+    # стартуем HTTP-сервер для Render (healthcheck на / и /healthz)
+    await start_http_server()
+
+    # потом запускаем бота
+
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":

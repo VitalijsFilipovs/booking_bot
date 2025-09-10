@@ -8,3 +8,4 @@ aiogram>=3.4
 asyncpg>=0.29
 python-dotenv>=1.0
 uvloop>=0.19; sys_platform == "linux"
+aiohttp>=3.9
