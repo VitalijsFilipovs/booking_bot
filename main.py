@@ -1,3 +1,4 @@
+# main.py
 import asyncio
 import logging
 import os
@@ -5,39 +6,96 @@ from contextlib import asynccontextmanager
 from datetime import datetime, date as _date, time as _time, UTC, timedelta
 
 import asyncpg
+from dotenv import load_dotenv
+
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import CommandStart, Command
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
-    BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+    BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
+    ChatMemberUpdated, Update
 )
 from aiogram.utils.markdown import hbold
-from dotenv import load_dotenv
-from aiogram.types import ForceReply
-from aiogram.filters import StateFilter
-from aiogram.types import ChatMemberUpdated
-from aiogram.exceptions import TelegramBadRequest
+
+
+# ============================= WEBHOOK + FastAPI =============================
 import os
-from aiohttp import web
+from fastapi import FastAPI, Request
+from aiogram.client.default import DefaultBotProperties
+from aiogram.types import Update
 
-async def _health(_):
-    return web.Response(text="ok")
+app = FastAPI()  # <-- это ВАЖНО
 
-async def start_http_server():
-    app = web.Application()
-    app.add_routes([web.get("/", _health), web.get("/healthz", _health)])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", "8000"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+# читаем ENV из начала файла (они уже загружены load_dotenv())
+WEBHOOK_BASE_URL   = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
+if not WEBHOOK_BASE_URL:
+    raise RuntimeError("WEBHOOK_BASE_URL is not set")
+WEBHOOK_SECRET_PATH = os.getenv("WEBHOOK_SECRET_PATH", "hook")
+WEBHOOK_PATH        = f"/webhook/{WEBHOOK_SECRET_PATH}"
+WEBHOOK_URL         = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+PORT                = int(os.getenv("PORT", "10000"))
 
+# ---------- ВАЖНО: ГЛОБАЛЬНЫЙ ASGI app ----------
+app = FastAPI()
 
-# ============================= I18N (тексты на 3 языках) =============================
+# Глобальные объекты (инициализируем в on_startup)
+bot: Bot | None = None
+dp: Dispatcher | None = None
+
+@app.get("/")
+@app.get("/health")
+@app.get("/healthz")
+async def health():
+    return "ok"
+
+@app.on_event("startup")
+async def on_startup():
+    global bot, dp
+
+    # БД
+    await init_db_pool()
+
+    # Бот и диспетчер
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    dp = Dispatcher()
+    dp.include_router(router)
+    dp.include_router(guard)
+
+    # Команды
+    for uid in STAFF_USER_IDS:
+        try:
+            await set_chat_admin_commands(bot, uid, "ru")
+        except Exception:
+            pass
+    if ADMIN_CHAT_ID:
+        await set_chat_admin_commands(bot, ADMIN_CHAT_ID, "ru")
+    await set_default_commands(bot)
+
+    # Регистрируем вебхук на свой Render-URL
+    await bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    if bot:
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            pass
+
+# Приём апдейтов от Telegram (должен совпасть с WEBHOOK_PATH)
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    assert bot is not None and dp is not None, "Bot/Dispatcher not ready yet"
+    data = await request.json()
+    update = Update.model_validate(data)
+    await dp.feed_update(bot, update)
+    return {"ok": True}
+
+# ============================= I18N =============================
 LANGS = ("ru", "lv", "en")
 
 I18N = {
@@ -192,7 +250,7 @@ I18N = {
         "menu": "📋 Menu: {url}",
         "menu_empty": "📋 Menu is not yet added. Set MENU_URL in .env",
         "id": "Your chat_id: {id}",
-        "err_date_format": "Enter date in DD.MM.YYYY (e.g. 05.09.2025)",
+        "err_date_format": "Enter date in DD.MM.YYYY (e.g., 05.09.2025)",
         "err_date_past": "Date is in the past",
         "err_time_format": "Enter time as 19:30 (also 19.30 or 1930 allowed).",
         "err_time_hours": "Bookings are accepted from {open} to {close}.",
@@ -242,7 +300,6 @@ I18N = {
 }
 
 def pick_default_lang(tg_code: str | None) -> str:
-    """Выбираем язык по коду телеграма пользователя"""
     if not tg_code:
         return "ru"
     code = tg_code.lower()
@@ -253,15 +310,14 @@ def pick_default_lang(tg_code: str | None) -> str:
     return "en"
 
 def T(lang: str, key: str, **kwargs) -> str:
-    """Шорткат для получения текста на языке"""
     txt = I18N.get(lang, I18N["ru"]).get(key, "")
     return txt.format(**kwargs)
 
 # ============================= Общие настройки =============================
-OPEN_TIME  = _time(10, 0)   # время открытия ресторана
-CLOSE_TIME = _time(22, 0)   # время закрытия
-DURATION_MIN = 120          # длительность брони, минут
-PAGE_SIZE = 10              # размер страницы в админ-панели
+OPEN_TIME  = _time(10, 0)
+CLOSE_TIME = _time(22, 0)
+DURATION_MIN = 120
+PAGE_SIZE = 10
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("booking_bot")
@@ -276,14 +332,12 @@ def _parse_ids(s: str) -> set[int]:
 
 load_dotenv()
 BOT_TOKEN     = os.getenv("BOT_TOKEN", "")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))   # твой user_id
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))  # чат (или личка) админа, куда слать уведомления
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 MENU_URL      = os.getenv("MENU_URL", "")
 DATABASE_URL  = os.getenv("DATABASE_URL", "")
 
 STAFF_USER_IDS: set[int] = _parse_ids(os.getenv("STAFF_USER_IDS", ""))
-
-# чтобы не забыть себя
 if ADMIN_USER_ID:
     STAFF_USER_IDS.add(ADMIN_USER_ID)
 
@@ -291,42 +345,27 @@ def is_staff(user_id: int | None) -> bool:
     return bool(user_id) and user_id in STAFF_USER_IDS
 
 def can_admin(user_id: int | None, chat_id: int | None, chat_type: str | None) -> bool:
-    """
-    Админ-действия можно делать только если:
-    - пользователь в списке STAFF, и
-    - это ЛС с ботом ИЛИ это наш админ-чат.
-    """
     return is_staff(user_id) and (chat_type == "private" or (ADMIN_CHAT_ID and chat_id == ADMIN_CHAT_ID))
 
-# Текстовые кнопки (для фильтров aiogram)
 BOOK_BTN_TEXTS   = [I18N[l]["btn_book"] for l in LANGS]
 MENU_BTN_TEXTS   = [I18N[l]["btn_menu"] for l in LANGS]
 CANCEL_BTN_TEXTS = [I18N[l]["btn_cancel"] for l in LANGS]
 CHANGE_LANG_BTN_TEXTS = [I18N[l]["btn_change_lang"] for l in LANGS]
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set. Put it into .env")
+    raise RuntimeError("BOT_TOKEN is not set")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set. Put Neon URL into .env")
+    raise RuntimeError("DATABASE_URL is not set")
 
-# ============================= Команды бота =============================
-# Публичные команды (видят все пользователи)
+# ============================= Команды =============================
 PUBLIC_COMMANDS = {
-    "ru": [
-        BotCommand(command="start", description="Главное меню"),
-        BotCommand(command="book",  description="Забронировать столик"),
-    ],
-    "lv": [
-        BotCommand(command="start", description="Galvenā izvēlne"),
-        BotCommand(command="book",  description="Rezervēt galdu"),
-    ],
-    "en": [
-        BotCommand(command="start", description="Main menu"),
-        BotCommand(command="book",  description="Reserve a table"),
-    ],
+    "ru": [BotCommand(command="start", description="Главное меню"),
+           BotCommand(command="book",  description="Забронировать столик")],
+    "lv": [BotCommand(command="start", description="Galvenā izvēlne"),
+           BotCommand(command="book",  description="Rezervēt galdu")],
+    "en": [BotCommand(command="start", description="Main menu"),
+           BotCommand(command="book",  description="Reserve a table")],
 }
-
-# Админская команда (выдаём только чату админа, чтобы не светилась всем)
 ADMIN_COMMANDS = {
     "ru": [BotCommand(command="admin", description="Админ-панель")],
     "lv": [BotCommand(command="admin", description="Admin panelis")],
@@ -334,23 +373,16 @@ ADMIN_COMMANDS = {
 }
 
 async def set_default_commands(bot: Bot):
-    """Регистрируем публичные команды по умолчанию (на уровне всего бота)"""
     for lang in ("ru", "lv", "en"):
-        await bot.set_my_commands(PUBLIC_COMMANDS[lang],
-                                  scope=BotCommandScopeDefault(),
-                                  language_code=lang)
+        await bot.set_my_commands(PUBLIC_COMMANDS[lang], scope=BotCommandScopeDefault(), language_code=lang)
 
 async def set_chat_public_commands(bot: Bot, chat_id: int, lang: str):
-    """Выдаём публичные команды конкретному пользователю под его язык"""
-    await bot.set_my_commands(PUBLIC_COMMANDS.get(lang, PUBLIC_COMMANDS["ru"]),
-                              scope=BotCommandScopeChat(chat_id=chat_id))
+    await bot.set_my_commands(PUBLIC_COMMANDS.get(lang, PUBLIC_COMMANDS["ru"]), scope=BotCommandScopeChat(chat_id=chat_id))
 
 async def set_chat_admin_commands(bot: Bot, chat_id: int, lang: str = "ru"):
-    """Выдаём /admin в чате администратора (личка или группа)"""
-    await bot.set_my_commands(ADMIN_COMMANDS.get(lang, ADMIN_COMMANDS["ru"]),
-                              scope=BotCommandScopeChat(chat_id=chat_id))
+    await bot.set_my_commands(ADMIN_COMMANDS.get(lang, ADMIN_COMMANDS["ru"]), scope=BotCommandScopeChat(chat_id=chat_id))
 
-# ============================= База данных =============================
+# ============================= БД =============================
 POOL: asyncpg.Pool | None = None
 
 CREATE_TABLES = """
@@ -384,14 +416,12 @@ CREATE TABLE IF NOT EXISTS bookings (
 """
 
 async def init_db_pool():
-    """Создаём пул подключений и инициализируем схему"""
     global POOL
     POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     async with POOL.acquire() as conn:
         await conn.execute(CREATE_TABLES)
         await conn.execute(CREATE_USERS)
         await conn.execute(CREATE_BOOKINGS)
-        # на случай старой схемы — добавим duration_min
         await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS duration_min INT NOT NULL DEFAULT 120;")
         cnt = await conn.fetchval("SELECT COUNT(*) FROM tables;")
         if cnt == 0:
@@ -403,19 +433,16 @@ async def init_db_pool():
 
 @asynccontextmanager
 async def get_conn():
-    """Удобный контекст для получения соединения"""
     assert POOL is not None, "DB pool is not initialized"
     async with POOL.acquire() as conn:
         yield conn
 
 async def get_lang(user_id: int, fallback: str = "ru") -> str:
-    """Язык пользователя из БД (или запасной)"""
     async with get_conn() as conn:
         lang = await conn.fetchval("SELECT lang FROM users WHERE user_id=$1", user_id)
     return lang or fallback
 
 async def set_lang(user_id: int, lang: str):
-    """Сохранить язык пользователя"""
     if lang not in LANGS:
         lang = "ru"
     async with get_conn() as conn:
@@ -425,10 +452,8 @@ async def set_lang(user_id: int, lang: str):
             user_id, lang
         )
 
-# ============================= Клавиатуры (Reply/Inline) =============================
-
+# ============================= Клавиатуры =============================
 def main_kb(lang: str, user_id: int | None = None, chat_id: int | None = None, chat_type: str | None = None) -> ReplyKeyboardMarkup:
-    """Главное меню. Админу добавляем кнопку '👑 Админ-панель'"""
     rows = [
         [KeyboardButton(text=I18N[lang]["btn_book"])],
         [KeyboardButton(text=I18N[lang]["btn_menu"])],
@@ -439,21 +464,13 @@ def main_kb(lang: str, user_id: int | None = None, chat_id: int | None = None, c
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 def cancel_kb(lang: str) -> ReplyKeyboardMarkup:
-    """Кнопка 'Отмена' для пошаговой формы"""
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=I18N[lang]["btn_cancel"])]],
-        resize_keyboard=True
-    )
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=I18N[lang]["btn_cancel"])]], resize_keyboard=True)
 
-# ============================= FSM (состояния брони) =============================
+# ============================= FSM состояния =============================
 router = Router()
-
-# ⬇️ Глобальные фильтры для ВСЕХ хэндлеров этого роутера:
-# принимать апдейты только из лички ИЛИ из чата-админа
 router.message.filter((F.chat.type == "private") | (F.chat.id == ADMIN_CHAT_ID))
 router.callback_query.filter((F.message.chat.type == "private") | (F.message.chat.id == ADMIN_CHAT_ID))
 
-# отдельный роутер для "дежурных" вещей без ограничений
 guard = Router(name="guard")
 
 @guard.message(F.chat.type.in_({"group", "supergroup"}))
@@ -465,7 +482,6 @@ async def auto_leave(msg: Message, bot: Bot):
 @guard.my_chat_member()
 async def on_added(ev: ChatMemberUpdated, bot: Bot):
     if ev.chat.type in {"group", "supergroup"} and ev.chat.id != ADMIN_CHAT_ID:
-        # бот стал участником/админом
         new_status = ev.new_chat_member.status
         if new_status in {"member", "administrator"}:
             await bot.leave_chat(ev.chat.id)
@@ -478,13 +494,10 @@ class BookingForm(StatesGroup):
     waiting_for_name = State()
     waiting_for_phone = State()
 
-# Состояние для запроса ID на удаление
-
 class AdminDelete(StatesGroup):
     waiting_for_id = State()
 
 def lang_kb() -> InlineKeyboardMarkup:
-    """Инлайн-выбор языка"""
     return InlineKeyboardMarkup(
         inline_keyboard=[[
             InlineKeyboardButton(text=I18N["ru"]["btn_lang_ru"], callback_data="lang:ru"),
@@ -513,9 +526,7 @@ def parse_time_localized(value: str, lang: str) -> _time:
     try:
         t = datetime.strptime(s, "%H:%M").time()
         if not (OPEN_TIME <= t <= CLOSE_TIME):
-            raise ValueError(T(lang, "err_time_hours",
-                               open=OPEN_TIME.strftime("%H:%M"),
-                               close=CLOSE_TIME.strftime("%H:%M")))
+            raise ValueError(T(lang, "err_time_hours", open=OPEN_TIME.strftime("%H:%M"), close=CLOSE_TIME.strftime("%H:%M")))
         return t
     except ValueError:
         raise ValueError(T(lang, "err_time_format"))
@@ -529,12 +540,8 @@ def parse_guests_localized(value: str, lang: str) -> int:
         raise ValueError(T(lang, "err_guests_range"))
     return n
 
-# ============================= Утилиты для статусов =============================
+# ============================= Статусы =============================
 async def set_status(booking_id: int, new_status: str) -> tuple[int | None, int | None]:
-    """
-    Обновляет статус брони и возвращает (id, user_id).
-    Если запись не найдена — (None, None).
-    """
     async with get_conn() as conn:
         row = await conn.fetchrow(
             "UPDATE bookings SET status=$1 WHERE id=$2 RETURNING id, user_id",
@@ -544,9 +551,7 @@ async def set_status(booking_id: int, new_status: str) -> tuple[int | None, int 
         return row["id"], row["user_id"]
     return None, None
 
-# ============================= ХЭНДЛЕРЫ ПОЛЬЗОВАТЕЛЯ =============================
-
-# === /start: приветствие + главное меню (админу добавляет кнопку "Админ-панель")
+# ============================= Хендлеры =============================
 @router.message(CommandStart())
 async def start_cmd(msg: Message, state: FSMContext):
     await state.clear()
@@ -555,47 +560,38 @@ async def start_cmd(msg: Message, state: FSMContext):
     if not lang:
         guess = pick_default_lang(msg.from_user.language_code)
         await set_lang(msg.from_user.id, guess)
-        await msg.answer(
-            T(guess, "start", btn_book=I18N[guess]["btn_book"]),
-            reply_markup=main_kb(guess, msg.from_user.id, msg.chat.id, msg.chat.type)
-        )
+        await msg.answer(T(guess, "start", btn_book=I18N[guess]["btn_book"]),
+                         reply_markup=main_kb(guess, msg.from_user.id, msg.chat.id, msg.chat.type))
         await msg.answer(T(guess, "choose_lang"), reply_markup=lang_kb())
         await set_chat_public_commands(msg.bot, msg.from_user.id, guess)
         return
-    await msg.answer(
-        T(lang, "start", btn_book=I18N[lang]["btn_book"]),
-        reply_markup=main_kb(lang, msg.from_user.id, msg.chat.id, msg.chat.type)
-    )
+    await msg.answer(T(lang, "start", btn_book=I18N[lang]["btn_book"]),
+                     reply_markup=main_kb(lang, msg.from_user.id, msg.chat.id, msg.chat.type))
     await set_chat_public_commands(msg.bot, msg.from_user.id, lang)
 
-# === Кнопка/команда смены языка -> показать инлайн-выбор языка
+
 @router.message(F.text.in_(CHANGE_LANG_BTN_TEXTS))
 @router.message(Command("lang"))
 async def choose_lang_cmd(msg: Message):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
     await msg.answer(T(lang, "choose_lang"), reply_markup=lang_kb())
 
-# === Клик по "🇷🇺/🇱🇻/🇬🇧" -> сохранить язык и перерисовать меню/команды
 @router.callback_query(F.data.startswith("lang:"))
 async def set_lang_cb(cb: CallbackQuery):
     lang = cb.data.split(":")[1]
     await set_lang(cb.from_user.id, lang)
     await cb.message.edit_reply_markup()
     await cb.message.answer(T(lang, "lang_set"))
-    await cb.message.answer(
-        T(lang, "start", btn_book=I18N[lang]["btn_book"]),
-        reply_markup=main_kb(lang, cb.from_user.id, cb.message.chat.id, cb.message.chat.type)
-    )
+    await cb.message.answer(T(lang, "start", btn_book=I18N[lang]["btn_book"]),
+                            reply_markup=main_kb(lang, cb.from_user.id, cb.message.chat.id, cb.message.chat.type))
     await set_chat_public_commands(cb.bot, cb.from_user.id, lang)
     await cb.answer()
 
-# === /id: прислать chat_id (удобно узнать id групп/личек)
 @router.message(Command("id"))
 async def get_id(msg: Message):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
     await msg.answer(T(lang, "id", id=hbold(msg.chat.id)))
 
-# === Кнопка "Посмотреть меню"
 @router.message(F.text.in_(MENU_BTN_TEXTS))
 async def show_menu(msg: Message):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
@@ -604,7 +600,6 @@ async def show_menu(msg: Message):
     else:
         await msg.answer(T(lang, "menu_empty"))
 
-# === Запуск бронирования: /book или "Забронировать столик"
 @router.message(Command("book"))
 @router.message(F.text.in_(BOOK_BTN_TEXTS))
 async def book_start(msg: Message, state: FSMContext):
@@ -613,47 +608,41 @@ async def book_start(msg: Message, state: FSMContext):
     await state.set_state(BookingForm.waiting_for_date)
     await msg.answer(T(lang, "ask_date"), reply_markup=cancel_kb(lang))
 
-# === Отмена бронирования в любой момент
 @router.message(F.text.in_(CANCEL_BTN_TEXTS))
 async def cancel(msg: Message, state: FSMContext):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
     await state.clear()
     await msg.answer(T(lang, "cancelled"), reply_markup=main_kb(lang, msg.from_user.id, msg.chat.id, msg.chat.type))
-# === Шаг 1: ждем дату
+
 @router.message(BookingForm.waiting_for_date)
 async def step_date(msg: Message, state: FSMContext):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
     try:
         d = parse_date_localized(msg.text, lang)
     except ValueError as e:
-        await msg.answer(str(e))
-        return
+        await msg.answer(str(e)); return
     await state.update_data(booking_date=d.isoformat())
     await state.set_state(BookingForm.waiting_for_time)
     await msg.answer(T(lang, "ask_time"))
 
-# === Шаг 2: ждем время
 @router.message(BookingForm.waiting_for_time)
 async def step_time(msg: Message, state: FSMContext):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
     try:
         t = parse_time_localized(msg.text, lang)
     except ValueError as e:
-        await msg.answer(str(e))
-        return
+        await msg.answer(str(e)); return
     await state.update_data(booking_time=t.strftime("%H:%M"))
     await state.set_state(BookingForm.waiting_for_guests)
     await msg.answer(T(lang, "ask_guests"))
 
-# === Шаг 3: ждем число гостей -> считаем свободные столы и показываем инлайн-список
 @router.message(BookingForm.waiting_for_guests)
 async def step_guests(msg: Message, state: FSMContext):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
     try:
         guests = parse_guests_localized(msg.text, lang)
     except ValueError as e:
-        await msg.answer(str(e))
-        return
+        await msg.answer(str(e)); return
     await state.update_data(guests=guests)
 
     data = await state.get_data()
@@ -682,10 +671,7 @@ async def step_guests(msg: Message, state: FSMContext):
               )
             ORDER BY t.seats, t.title
             """,
-            int(guests),
-            new_date,
-            new_end_dt.time(),  # $3
-            new_start           # $4
+            int(guests), new_date, new_end_dt.time(), new_start
         )
 
     if not rows:
@@ -702,7 +688,6 @@ async def step_guests(msg: Message, state: FSMContext):
     await state.set_state(BookingForm.waiting_for_table)
     await msg.answer(T(lang, "ask_table"), reply_markup=kb)
 
-# === Клик по конкретному столу из списка
 @router.callback_query(F.data.startswith("pick_table:"))
 async def pick_table(cb: CallbackQuery, state: FSMContext):
     lang = await get_lang(cb.from_user.id, pick_default_lang(cb.from_user.language_code))
@@ -713,26 +698,22 @@ async def pick_table(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer(T(lang, "ask_name"))
     await cb.answer()
 
-# === Шаг 4: имя
 @router.message(BookingForm.waiting_for_name)
 async def step_name(msg: Message, state: FSMContext):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
     name = msg.text.strip()
     if len(name) < 2:
-        await msg.answer(T(lang, "err_name_short"))
-        return
+        await msg.answer(T(lang, "err_name_short")); return
     await state.update_data(name=name)
     await state.set_state(BookingForm.waiting_for_phone)
     await msg.answer(T(lang, "ask_phone"))
 
-# === Шаг 5: телефон -> сохраняем бронь, шлем админу уведомление и кнопки
 @router.message(BookingForm.waiting_for_phone)
 async def step_phone(msg: Message, state: FSMContext):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
     phone = msg.text.strip()
     if len(phone) < 6:
-        await msg.answer(T(lang, "err_phone_short"))
-        return
+        await msg.answer(T(lang, "err_phone_short")); return
 
     data = await state.get_data()
     data.update({"phone": phone, "user_id": msg.from_user.id})
@@ -772,7 +753,7 @@ async def step_phone(msg: Message, state: FSMContext):
         inline_keyboard=[[
             InlineKeyboardButton(text=T(user_lang, "btn_admin_confirm"), callback_data=f"adm:confirm:{booking_id}"),
             InlineKeyboardButton(text=T(user_lang, "btn_admin_cancel"),  callback_data=f"adm:cancel:{booking_id}"),
-            InlineKeyboardButton(text=I18N[user_lang]["btn_admin_delete"],callback_data=f"ap:delete:{booking_id}")
+            InlineKeyboardButton(text=I18N[user_lang]["btn_admin_delete"], callback_data=f"ap:delete:{booking_id}")
         ]]
     )
     try:
@@ -784,29 +765,23 @@ async def step_phone(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer(T(lang, "thanks"), reply_markup=main_kb(lang, msg.from_user.id, msg.chat.id, msg.chat.type))
 
-from aiogram.filters import StateFilter
-
-# 1) Кнопка «Delete…» -> просим ID и ставим состояние
+# ===== Удаление по ID =====
 @router.callback_query(F.data.startswith("ap:delask:"))
 async def ap_delask(cb: CallbackQuery, state: FSMContext):
     if not can_admin(cb.from_user.id, cb.message.chat.id, cb.message.chat.type):
         return await cb.answer()
     await state.set_state(AdminDelete.waiting_for_id)
-
     await cb.message.answer("Введите номер брони (ID), например: 12")
     await cb.answer()
 
-# 2) /del без аргумента -> тоже ставим состояние
 @router.message(Command("del"))
 async def del_cmd(msg: Message, state: FSMContext):
-    if not can_admin(msg.from_user.id, msg.chat.id, msg.chat.type):  # новое
+    if not can_admin(msg.from_user.id, msg.chat.id, msg.chat.type):
         return
     parts = (msg.text or "").split()
-    if len(parts) < 2:  # нет ID
+    if len(parts) < 2:
         await state.set_state(AdminDelete.waiting_for_id)
-
         return await msg.answer("Укажи ID: /del 12  (или просто напиши число)")
-    # /del 12
     bid_str = parts[1].lstrip("#")
     if not bid_str.isdigit():
         return await msg.answer("ID должен быть числом. Пример: /del 12")
@@ -815,14 +790,9 @@ async def del_cmd(msg: Message, state: FSMContext):
         row = await conn.fetchrow("DELETE FROM bookings WHERE id=$1 RETURNING id", bid)
     await msg.answer(f"Бронь #{bid} удалена." if row else f"Бронь #{bid} не найдена.")
 
-# 3) Ввод просто числа, когда ждём ID (работает и для "12", и для "#12")
-@router.message(
-    StateFilter(AdminDelete.waiting_for_id),
-    F.text.regexp(r"^\s*#?\d+\s*$"),
-    flags={"block": True}  # чтобы дальше не шло
-)
+@router.message(StateFilter(AdminDelete.waiting_for_id), F.text.regexp(r"^\s*#?\d+\s*$"), flags={"block": True})
 async def ap_delete_by_id_input(msg: Message, state: FSMContext):
-    if not can_admin(msg.from_user.id, msg.chat.id, msg.chat.type):  # новое
+    if not can_admin(msg.from_user.id, msg.chat.id, msg.chat.type):
         return
     bid = int((msg.text or "").strip().lstrip("#"))
     async with get_conn() as conn:
@@ -830,17 +800,13 @@ async def ap_delete_by_id_input(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer(f"Бронь #{bid} удалена." if row else f"Бронь #{bid} не найдена.")
 
-# 4) Если ввели не число (и это не команда) — подсказываем формат
 @router.message(StateFilter(AdminDelete.waiting_for_id), flags={"block": True})
 async def ap_delete_by_id_wrong(msg: Message):
     if (msg.text or "").startswith("/"):
-        return  # не мешаем обработчику /del
+        return
     await msg.answer("Нужно число. Пример: 12")
 
-
-# ============================= Коллбеки из уведомления админа =============================
-
-# === Кнопка "Подтвердить" в сообщении админу
+# ===== Коллбеки админа из уведомлений =====
 @router.callback_query(F.data.startswith("adm:confirm:"))
 async def admin_confirm(cb: CallbackQuery):
     booking_id = int(cb.data.split(":")[2])
@@ -855,7 +821,6 @@ async def admin_confirm(cb: CallbackQuery):
         pass
     await cb.answer("OK")
 
-# === Кнопка "Отменить" в сообщении админу
 @router.callback_query(F.data.startswith("adm:cancel:"))
 async def admin_cancel(cb: CallbackQuery):
     booking_id = int(cb.data.split(":")[2])
@@ -870,8 +835,7 @@ async def admin_cancel(cb: CallbackQuery):
         pass
     await cb.answer("OK")
 
-# ============================= Мини-панель админа (/admin) =============================
-    """Формат строки брони для списка в панели"""
+# ===== Мини-панель админа (/admin) =====
 def fmt_admin_booking_line(row, lang: str) -> str:
     return (f"#{row['id']} — {row['booking_date']} {row['booking_time']}, "
             f"{T(lang,'admin_field_table').lower()}:{row['table_id'] or '—'}, "
@@ -879,7 +843,6 @@ def fmt_admin_booking_line(row, lang: str) -> str:
             f"{row['name']} ({row['phone']}) [{row['status']}]")
 
 async def fetch_bookings(page: int = 0, status: str = "all"):
-    """Чтение списка броней с пагинацией и фильтром по статусу"""
     offset = page * PAGE_SIZE
     where = "" if status == "all" else "WHERE status = $1"
     params = [] if status == "all" else [status]
@@ -902,15 +865,10 @@ def admin_list_kb(page: int, status: str, lang: str = "ru") -> InlineKeyboardMar
         "confirmed": I18N[lang]["admin_filter_confirmed"],
         "cancelled": I18N[lang]["admin_filter_cancelled"],
     }.get(status, status)
-
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="⬅️", callback_data=f"ap:page:{max(page-1,0)}:{status}"),
-            # «бейдж» без действия
-            InlineKeyboardButton(
-                text=f"{I18N[lang]['admin_status_label']}: {status_disp}",
-                callback_data="ap:nop"
-            ),
+            InlineKeyboardButton(text=f"{I18N[lang]['admin_status_label']}: {status_disp}", callback_data="ap:nop"),
             InlineKeyboardButton(text="➡️", callback_data=f"ap:page:{page+1}:{status}"),
         ],
         [
@@ -924,19 +882,8 @@ def admin_list_kb(page: int, status: str, lang: str = "ru") -> InlineKeyboardMar
 
 @router.callback_query(F.data == "ap:nop")
 async def ap_nop(cb: CallbackQuery):
-    # ничего не делаем, просто гасим «часики»
     await cb.answer()
 
-
-def admin_item_kb(booking_id: int) -> InlineKeyboardMarkup:
-    """Кнопки для конкретной брони (если решишь показывать карточки по одной)"""
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ confirm", callback_data=f"ap:confirm:{booking_id}"),
-        InlineKeyboardButton(text="❌ cancel",  callback_data=f"ap:cancel:{booking_id}"),
-        InlineKeyboardButton(text="🗑 delete",  callback_data=f"ap:delete:{booking_id}"),
-    ]])
-
-# === /admin или кнопка "👑 Админ-панель"
 @router.message(F.text == I18N["ru"]["btn_admin_panel"])
 @router.message(F.text == I18N["lv"]["btn_admin_panel"])
 @router.message(F.text == I18N["en"]["btn_admin_panel"])
@@ -945,7 +892,6 @@ async def admin_panel(msg: Message):
     if not can_admin(msg.from_user.id, msg.chat.id, msg.chat.type):
         return
     lang = await get_lang(msg.from_user.id, "ru")
-
     status = "all"
     status_disp = {
         "all": I18N[lang]["admin_filter_all"],
@@ -953,61 +899,44 @@ async def admin_panel(msg: Message):
         "confirmed": I18N[lang]["admin_filter_confirmed"],
         "cancelled": I18N[lang]["admin_filter_cancelled"],
     }[status]
-
     rows = await fetch_bookings(page=0, status=status)
-    header = T(lang, "admin_list_header",
-               page=1, status_label=I18N[lang]["admin_status_label"], status=status_disp)
+    header = T(lang, "admin_list_header", page=1, status_label=I18N[lang]["admin_status_label"], status=status_disp)
     text = header + "\n\n" + ("\n".join([fmt_admin_booking_line(r, lang) for r in rows]) if rows else T(lang,"empty"))
     await msg.answer(text, reply_markup=admin_list_kb(0, status, lang))
     await msg.answer("🤗", reply_markup=main_kb(lang, msg.from_user.id, msg.chat.id, msg.chat.type))
 
-
-# Обработка ввода ID-резервации и удаление резервации стола
 @router.message(AdminDelete.waiting_for_id)
 async def ap_delete_waiting(msg: Message, state: FSMContext):
-    if not can_admin(msg.from_user.id, msg.chat.id, msg.chat.type):  # новое
+    if not can_admin(msg.from_user.id, msg.chat.id, msg.chat.type):
         return
-
     txt = (msg.text or "").strip()
-    # если админ передумал и вводит команду (/del …) — не мешаем,
-    # пусть обработает хэндлер команды
     if txt.startswith("/"):
         return
-
     bid_str = txt.lstrip("#").replace(" ", "")
     if not bid_str.isdigit():
         return await msg.answer("Нужно число. Пример: 12")
-
     bid = int(bid_str)
     async with get_conn() as conn:
         row = await conn.fetchrow("DELETE FROM bookings WHERE id=$1 RETURNING id", bid)
-
     await state.clear()
     await msg.answer(f"Бронь #{bid} удалена." if row else f"Бронь #{bid} не найдена.")
 
-
-# === Стрелки листания
 @router.callback_query(F.data.startswith("ap:page:"))
 async def ap_page(cb: CallbackQuery):
     if not can_admin(cb.from_user.id, cb.message.chat.id, cb.message.chat.type):
         return await cb.answer()
-
     _, _, page_str, status = cb.data.split(":")
     page = max(int(page_str), 0)
     lang = await get_lang(cb.from_user.id, "ru")
-
     status_disp = {
         "all": I18N[lang]["admin_filter_all"],
         "new": I18N[lang]["admin_filter_new"],
         "confirmed": I18N[lang]["admin_filter_confirmed"],
         "cancelled": I18N[lang]["admin_filter_cancelled"],
     }.get(status, status)
-
     rows = await fetch_bookings(page=page, status=status)
-    header = T(lang, "admin_list_header", page=page+1,
-               status_label=I18N[lang]["admin_status_label"], status=status_disp)
+    header = T(lang, "admin_list_header", page=page+1, status_label=I18N[lang]["admin_status_label"], status=status_disp)
     text = header + "\n\n" + ("\n".join([fmt_admin_booking_line(r, lang) for r in rows]) if rows else T(lang, "empty"))
-
     try:
         await cb.message.edit_text(text, reply_markup=admin_list_kb(page, status, lang))
     except TelegramBadRequest as e:
@@ -1015,30 +944,22 @@ async def ap_page(cb: CallbackQuery):
             raise
     await cb.answer()
 
-
-# === Кнопки фильтра статуса
 @router.callback_query(F.data.startswith("ap:set_status:"))
 async def ap_set_status(cb: CallbackQuery):
     if not can_admin(cb.from_user.id, cb.message.chat.id, cb.message.chat.type):
         return await cb.answer()
-
     _, _, page_str, status = cb.data.split(":")
     page = max(int(page_str), 0)
     lang = await get_lang(cb.from_user.id, "ru")
-
     status_disp = {
         "all": I18N[lang]["admin_filter_all"],
         "new": I18N[lang]["admin_filter_new"],
         "confirmed": I18N[lang]["admin_filter_confirmed"],
         "cancelled": I18N[lang]["admin_filter_cancelled"],
     }.get(status, status)
-
     rows = await fetch_bookings(page=page, status=status)
-    header = T(lang, "admin_list_header", page=page+1,
-               status_label=I18N[lang]["admin_status_label"], status=status_disp)
+    header = T(lang, "admin_list_header", page=page+1, status_label=I18N[lang]["admin_status_label"], status=status_disp)
     text = header + "\n\n" + ("\n".join([fmt_admin_booking_line(r, lang) for r in rows]) if rows else T(lang, "empty"))
-
-    from aiogram.exceptions import TelegramBadRequest
     try:
         await cb.message.edit_text(text, reply_markup=admin_list_kb(page, status, lang))
     except TelegramBadRequest as e:
@@ -1046,9 +967,6 @@ async def ap_set_status(cb: CallbackQuery):
             raise
     await cb.answer(I18N[lang]["admin_status_label"] + " ✓")
 
-
-
-# === Действия над бронью из панели (подтверждение/отмена/удаление)
 @router.callback_query(F.data.startswith("ap:confirm:"))
 async def ap_confirm(cb: CallbackQuery):
     if not can_admin(cb.from_user.id, cb.message.chat.id, cb.message.chat.type):
@@ -1093,45 +1011,6 @@ async def whoami(msg: Message):
         f"name: {msg.from_user.full_name}"
     )
 
-# ============================= Запуск приложения =============================
-async def main():
-    await init_db_pool()
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-    # в main(), после bot = Bot(...)
-    for uid in STAFF_USER_IDS:
-        try:
-            await set_chat_admin_commands(bot, uid, "ru")
-        except Exception:
-            pass
-
-    # и для самого админ-чата:
-    if ADMIN_CHAT_ID:
-        await set_chat_admin_commands(bot, ADMIN_CHAT_ID, "ru")
-
-    dp = Dispatcher()
-    dp.include_router(router)
-    dp.include_router(guard)  # <- автовыход из групп
-
-    # Публичные команды видно всем
-    await set_default_commands(bot)
-
-    # Явно выдаём /admin только чату админа
-    if ADMIN_CHAT_ID:
-        await set_chat_admin_commands(bot, ADMIN_CHAT_ID, "ru")
-
-
-
-    logger.info("Bot started")
-    # стартуем HTTP-сервер для Render (healthcheck на / и /healthz)
-    await start_http_server()
-
-    # потом запускаем бота
-
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped")
-
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
