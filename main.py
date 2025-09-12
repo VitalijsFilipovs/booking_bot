@@ -22,89 +22,63 @@ from aiogram.types import (
 )
 from aiogram.utils.markdown import hbold
 
-
 # ============================= WEBHOOK + FastAPI =============================
-import os
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import Update
 
-app = FastAPI()  # <-- это ВАЖНО
+# ============================= ЛОГИ =============================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("booking_bot")
 
-# читаем ENV из начала файла (они уже загружены load_dotenv())
-WEBHOOK_BASE_URL   = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
+# ============================= ENV =============================
+load_dotenv()
+
+WEBHOOK_BASE_URL     = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
 if not WEBHOOK_BASE_URL:
     raise RuntimeError("WEBHOOK_BASE_URL is not set")
-WEBHOOK_SECRET_PATH = os.getenv("WEBHOOK_SECRET_PATH", "hook")
-WEBHOOK_PATH        = f"/webhook/{WEBHOOK_SECRET_PATH}"
-WEBHOOK_URL         = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
-PORT                = int(os.getenv("PORT", "10000"))
 
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    assert bot is not None and dp is not None, "Bot/Dispatcher not ready yet"
-    data = await request.json()
-    logger.info("Webhook update: %s", json.dumps(data, ensure_ascii=False))
-    update = Update.model_validate(data)
-    await dp.feed_update(bot, update)
-    return {"ok": True}
+WEBHOOK_SECRET_PATH  = os.getenv("WEBHOOK_SECRET_PATH", "hook").strip("/")
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "")
+WEBHOOK_PATH         = f"/webhook/{WEBHOOK_SECRET_PATH}"
+WEBHOOK_URL          = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+PORT                 = int(os.getenv("PORT", "10000"))
 
-@app.get("/", include_in_schema=False)
-async def health():
-    return {"status": "ok"}
+BOT_TOKEN     = os.getenv("BOT_TOKEN", "")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+MENU_URL      = os.getenv("MENU_URL", "")
+DATABASE_URL  = os.getenv("DATABASE_URL", "")
 
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
-# ---------- ВАЖНО: ГЛОБАЛЬНЫЙ ASGI app ----------
+# ============================= FASTAPI APP =============================
+app = FastAPI()
 
 # Глобальные объекты (инициализируем в on_startup)
 bot: Bot | None = None
 dp: Dispatcher | None = None
 
-@app.get("/")
-@app.get("/health")
-@app.get("/healthz")
+# Health (GET/HEAD → 200)
+@app.get("/", include_in_schema=False)
+@app.get("/health", include_in_schema=False)
+@app.get("/healthz", include_in_schema=False)
 async def health():
-    return "ok"
+    return {"status": "ok"}
 
-@app.on_event("startup")
-async def on_startup():
-    global bot, dp
-
-    # БД
-    await init_db_pool()
-
-    # Бот и диспетчер
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-    dp = Dispatcher()
-    dp.include_router(router)
-    dp.include_router(guard)
-
-    # Команды
-    for uid in STAFF_USER_IDS:
-        try:
-            await set_chat_admin_commands(bot, uid, "ru")
-        except Exception:
-            pass
-    if ADMIN_CHAT_ID:
-        await set_chat_admin_commands(bot, ADMIN_CHAT_ID, "ru")
-    await set_default_commands(bot)
-
-    # Регистрируем вебхук на свой Render-URL
-    await bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    if bot:
-        try:
-            await bot.delete_webhook(drop_pending_updates=False)
-        except Exception:
-            pass
-
-# Приём апдейтов от Telegram (должен совпасть с WEBHOOK_PATH)
+# Приём апдейтов от Telegram (один обработчик)
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
+    # Проверка секрета вебхука
+    if WEBHOOK_SECRET_TOKEN:
+        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if token != WEBHOOK_SECRET_TOKEN:
+            raise HTTPException(status_code=403, detail="Invalid webhook secret")
     assert bot is not None and dp is not None, "Bot/Dispatcher not ready yet"
     data = await request.json()
+    logger.debug("Webhook update keys: %s", list(data.keys()))
     update = Update.model_validate(data)
     await dp.feed_update(bot, update)
     return {"ok": True}
@@ -333,9 +307,6 @@ CLOSE_TIME = _time(22, 0)
 DURATION_MIN = 120
 PAGE_SIZE = 10
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("booking_bot")
-
 def _parse_ids(s: str) -> set[int]:
     ids = set()
     for part in s.replace(";", ",").split(","):
@@ -343,13 +314,6 @@ def _parse_ids(s: str) -> set[int]:
         if part.isdigit():
             ids.add(int(part))
     return ids
-
-load_dotenv()
-BOT_TOKEN     = os.getenv("BOT_TOKEN", "")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-MENU_URL      = os.getenv("MENU_URL", "")
-DATABASE_URL  = os.getenv("DATABASE_URL", "")
 
 STAFF_USER_IDS: set[int] = _parse_ids(os.getenv("STAFF_USER_IDS", ""))
 if ADMIN_USER_ID:
@@ -360,16 +324,6 @@ def is_staff(user_id: int | None) -> bool:
 
 def can_admin(user_id: int | None, chat_id: int | None, chat_type: str | None) -> bool:
     return is_staff(user_id) and (chat_type == "private" or (ADMIN_CHAT_ID and chat_id == ADMIN_CHAT_ID))
-
-BOOK_BTN_TEXTS   = [I18N[l]["btn_book"] for l in LANGS]
-MENU_BTN_TEXTS   = [I18N[l]["btn_menu"] for l in LANGS]
-CANCEL_BTN_TEXTS = [I18N[l]["btn_cancel"] for l in LANGS]
-CHANGE_LANG_BTN_TEXTS = [I18N[l]["btn_change_lang"] for l in LANGS]
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
 
 # ============================= Команды =============================
 PUBLIC_COMMANDS = {
@@ -428,6 +382,12 @@ CREATE TABLE IF NOT EXISTS bookings (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
+# Индексы для ускорения выборок
+CREATE_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_bookings_date_time ON bookings(booking_date, booking_time);
+CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status);
+CREATE INDEX IF NOT EXISTS idx_bookings_table ON bookings(table_id);
+"""
 
 async def init_db_pool():
     global POOL
@@ -436,6 +396,7 @@ async def init_db_pool():
         await conn.execute(CREATE_TABLES)
         await conn.execute(CREATE_USERS)
         await conn.execute(CREATE_BOOKINGS)
+        await conn.execute(CREATE_INDEXES)
         await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS duration_min INT NOT NULL DEFAULT 120;")
         cnt = await conn.fetchval("SELECT COUNT(*) FROM tables;")
         if cnt == 0:
@@ -539,7 +500,10 @@ def parse_time_localized(value: str, lang: str) -> _time:
         s = f"{s[:2]}:{s[2:]}"
     try:
         t = datetime.strptime(s, "%H:%M").time()
-        if not (OPEN_TIME <= t <= CLOSE_TIME):
+        # Проверяем и конец слота
+        start_dt = datetime.combine(_date.today(), t)
+        end_dt = start_dt + timedelta(minutes=DURATION_MIN)
+        if not (OPEN_TIME <= t <= CLOSE_TIME) or end_dt.time() > CLOSE_TIME:
             raise ValueError(T(lang, "err_time_hours", open=OPEN_TIME.strftime("%H:%M"), close=CLOSE_TIME.strftime("%H:%M")))
         return t
     except ValueError:
@@ -583,8 +547,7 @@ async def start_cmd(msg: Message, state: FSMContext):
                      reply_markup=main_kb(lang, msg.from_user.id, msg.chat.id, msg.chat.type))
     await set_chat_public_commands(msg.bot, msg.from_user.id, lang)
 
-
-@router.message(F.text.in_(CHANGE_LANG_BTN_TEXTS))
+@router.message(F.text.in_([I18N["ru"]["btn_change_lang"], I18N["lv"]["btn_change_lang"], I18N["en"]["btn_change_lang"]]))
 @router.message(Command("lang"))
 async def choose_lang_cmd(msg: Message):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
@@ -606,7 +569,7 @@ async def get_id(msg: Message):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
     await msg.answer(T(lang, "id", id=hbold(msg.chat.id)))
 
-@router.message(F.text.in_(MENU_BTN_TEXTS))
+@router.message(F.text.in_([I18N["ru"]["btn_menu"], I18N["lv"]["btn_menu"], I18N["en"]["btn_menu"]]))
 async def show_menu(msg: Message):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
     if MENU_URL:
@@ -615,14 +578,14 @@ async def show_menu(msg: Message):
         await msg.answer(T(lang, "menu_empty"))
 
 @router.message(Command("book"))
-@router.message(F.text.in_(BOOK_BTN_TEXTS))
+@router.message(F.text.in_([I18N["ru"]["btn_book"], I18N["lv"]["btn_book"], I18N["en"]["btn_book"]]))
 async def book_start(msg: Message, state: FSMContext):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
     await state.clear()
     await state.set_state(BookingForm.waiting_for_date)
     await msg.answer(T(lang, "ask_date"), reply_markup=cancel_kb(lang))
 
-@router.message(F.text.in_(CANCEL_BTN_TEXTS))
+@router.message(F.text.in_([I18N["ru"]["btn_cancel"], I18N["lv"]["btn_cancel"], I18N["en"]["btn_cancel"]]))
 async def cancel(msg: Message, state: FSMContext):
     lang = await get_lang(msg.from_user.id, pick_default_lang(msg.from_user.language_code))
     await state.clear()
@@ -785,7 +748,7 @@ async def ap_delask(cb: CallbackQuery, state: FSMContext):
     if not can_admin(cb.from_user.id, cb.message.chat.id, cb.message.chat.type):
         return await cb.answer()
     await state.set_state(AdminDelete.waiting_for_id)
-    await cb.message.answer("Введите номер брони (ID), например: 12")
+    await cb.message.answer(I18N["ru"]["enter_booking_id"])
     await cb.answer()
 
 @router.message(Command("del"))
@@ -795,14 +758,14 @@ async def del_cmd(msg: Message, state: FSMContext):
     parts = (msg.text or "").split()
     if len(parts) < 2:
         await state.set_state(AdminDelete.waiting_for_id)
-        return await msg.answer("Укажи ID: /del 12  (или просто напиши число)")
+        return await msg.answer(I18N["ru"]["ask_id"])
     bid_str = parts[1].lstrip("#")
     if not bid_str.isdigit():
-        return await msg.answer("ID должен быть числом. Пример: /del 12")
+        return await msg.answer(I18N["ru"]["id_must_be_number"])
     bid = int(bid_str)
     async with get_conn() as conn:
         row = await conn.fetchrow("DELETE FROM bookings WHERE id=$1 RETURNING id", bid)
-    await msg.answer(f"Бронь #{bid} удалена." if row else f"Бронь #{bid} не найдена.")
+    await msg.answer(I18N["ru"]["booking_deleted"].format(id=bid) if row else I18N["ru"]["booking_not_found"].format(id=bid))
 
 @router.message(StateFilter(AdminDelete.waiting_for_id), F.text.regexp(r"^\s*#?\d+\s*$"), flags={"block": True})
 async def ap_delete_by_id_input(msg: Message, state: FSMContext):
@@ -812,13 +775,13 @@ async def ap_delete_by_id_input(msg: Message, state: FSMContext):
     async with get_conn() as conn:
         row = await conn.fetchrow("DELETE FROM bookings WHERE id=$1 RETURNING id", bid)
     await state.clear()
-    await msg.answer(f"Бронь #{bid} удалена." if row else f"Бронь #{bid} не найдена.")
+    await msg.answer(I18N["ru"]["booking_deleted"].format(id=bid) if row else I18N["ru"]["booking_not_found"].format(id=bid))
 
 @router.message(StateFilter(AdminDelete.waiting_for_id), flags={"block": True})
 async def ap_delete_by_id_wrong(msg: Message):
     if (msg.text or "").startswith("/"):
         return
-    await msg.answer("Нужно число. Пример: 12")
+    await msg.answer(I18N["ru"]["need_number"])
 
 # ===== Коллбеки админа из уведомлений =====
 @router.callback_query(F.data.startswith("adm:confirm:"))
@@ -919,7 +882,7 @@ async def admin_panel(msg: Message):
     await msg.answer(text, reply_markup=admin_list_kb(0, status, lang))
     await msg.answer("🤗", reply_markup=main_kb(lang, msg.from_user.id, msg.chat.id, msg.chat.type))
 
-@router.message(AdminDelete.waiting_for_id)
+@router.message(StateFilter(AdminDelete.waiting_for_id))
 async def ap_delete_waiting(msg: Message, state: FSMContext):
     if not can_admin(msg.from_user.id, msg.chat.id, msg.chat.type):
         return
@@ -928,12 +891,12 @@ async def ap_delete_waiting(msg: Message, state: FSMContext):
         return
     bid_str = txt.lstrip("#").replace(" ", "")
     if not bid_str.isdigit():
-        return await msg.answer("Нужно число. Пример: 12")
+        return await msg.answer(I18N["ru"]["need_number"])
     bid = int(bid_str)
     async with get_conn() as conn:
         row = await conn.fetchrow("DELETE FROM bookings WHERE id=$1 RETURNING id", bid)
     await state.clear()
-    await msg.answer(f"Бронь #{bid} удалена." if row else f"Бронь #{bid} не найдена.")
+    await msg.answer(I18N["ru"]["booking_deleted"].format(id=bid) if row else I18N["ru"]["booking_not_found"].format(id=bid))
 
 @router.callback_query(F.data.startswith("ap:page:"))
 async def ap_page(cb: CallbackQuery):
@@ -1025,6 +988,56 @@ async def whoami(msg: Message):
         f"name: {msg.from_user.full_name}"
     )
 
+# ============================= Стартап/Шатдаун =============================
+@app.on_event("startup")
+async def on_startup():
+    global bot, dp
+    await init_db_pool()
+
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    dp = Dispatcher()
+
+    # Middleware: лог «медленных» апдейтов
+    @dp.update.outer_middleware()
+    class SlowLogMiddleware:
+        async def __call__(self, handler, event, data):
+            t0 = datetime.now(UTC)
+            try:
+                return await handler(event, data)
+            finally:
+                dt = (datetime.now(UTC) - t0).total_seconds() * 1000
+                if dt > 1200:  # > 1.2s
+                    logger.warning("Slow update (%d ms): %s", int(dt), type(event).__name__)
+
+    dp.include_router(router)
+    dp.include_router(guard)
+
+    # Команды
+    for uid in STAFF_USER_IDS:
+        try:
+            await set_chat_admin_commands(bot, uid, "ru")
+        except Exception:
+            pass
+    if ADMIN_CHAT_ID:
+        await set_chat_admin_commands(bot, ADMIN_CHAT_ID, "ru")
+    await set_default_commands(bot)
+
+    # Вебхук с секретом
+    await bot.set_webhook(
+        url=WEBHOOK_URL,
+        drop_pending_updates=True,
+        secret_token=WEBHOOK_SECRET_TOKEN or None,
+    )
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    if bot:
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            pass
+
+# ============================= Точка входа =============================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
