@@ -999,15 +999,14 @@ async def on_startup():
 
     # Middleware: лог «медленных» апдейтов
     @dp.update.outer_middleware()
-    class SlowLogMiddleware:
-        async def __call__(self, handler, event, data):
-            t0 = datetime.now(UTC)
-            try:
-                return await handler(event, data)
-            finally:
-                dt = (datetime.now(UTC) - t0).total_seconds() * 1000
-                if dt > 1200:  # > 1.2s
-                    logger.warning("Slow update (%d ms): %s", int(dt), type(event).__name__)
+    async def slow_log(handler, event, data):
+        t0 = datetime.now(UTC)
+        try:
+            return await handler(event, data)
+        finally:
+            dt_ms = (datetime.now(UTC) - t0).total_seconds() * 1000
+            if dt_ms > 1200:
+                logger.warning("Slow update (%d ms): %s", int(dt_ms), type(event).__name__)
 
     dp.include_router(router)
     dp.include_router(guard)
