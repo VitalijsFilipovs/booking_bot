@@ -40,16 +40,8 @@ WEBHOOK_PATH        = f"/webhook/{WEBHOOK_SECRET_PATH}"
 WEBHOOK_URL         = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
 PORT                = int(os.getenv("PORT", "10000"))
 
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    assert bot is not None and dp is not None, "Bot/Dispatcher not ready yet"
-    data = await request.json()
-    logger.info("Webhook update: %s", json.dumps(data, ensure_ascii=False))
-    update = Update.model_validate(data)
-    await dp.feed_update(bot, update)
-    return {"ok": True}
-
 # ---------- ВАЖНО: ГЛОБАЛЬНЫЙ ASGI app ----------
+app = FastAPI()
 
 # Глобальные объекты (инициализируем в on_startup)
 bot: Bot | None = None
