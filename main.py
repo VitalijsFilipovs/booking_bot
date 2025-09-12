@@ -77,7 +77,17 @@ async def on_startup():
     await set_default_commands(bot)
 
     # Регистрируем вебхук на свой Render-URL
-    await bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+    # было:
+    # await bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+
+    # стало:
+    info = await bot.get_webhook_info()
+    if info.url != WEBHOOK_URL:
+        await bot.set_webhook(
+            url=WEBHOOK_URL,
+            allowed_updates=["message", "callback_query", "my_chat_member"],
+            drop_pending_updates=False,  # важно!
+        )
 
 @app.on_event("shutdown")
 async def on_shutdown():
