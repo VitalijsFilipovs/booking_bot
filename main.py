@@ -49,11 +49,6 @@ async def telegram_webhook(request: Request):
     await dp.feed_update(bot, update)
     return {"ok": True}
 
-@app.get("/", include_in_schema=False)
-async def health():
-    return {"status": "ok"}
-
-
 # ---------- ВАЖНО: ГЛОБАЛЬНЫЙ ASGI app ----------
 
 # Глобальные объекты (инициализируем в on_startup)
