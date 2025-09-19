@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import json
+import signal
 from contextlib import asynccontextmanager
 from datetime import datetime, date as _date, time as _time, UTC, timedelta
 
@@ -23,10 +24,7 @@ from aiogram.types import (
 from aiogram.utils.markdown import hbold
 
 # ============================= WEBHOOK + FastAPI =============================
-import os
-from fastapi import FastAPI, Request, Response  # <-- добавили Response
-from aiogram.client.default import DefaultBotProperties
-from aiogram.types import Update
+from fastapi import FastAPI, Request
 
 app = FastAPI()  # <-- это ВАЖНО
 
@@ -52,12 +50,10 @@ dp: Dispatcher | None = None
 async def health():
     return "ok"
 
-# --- HEAD-обработчики для health-check от Render (исправляет 405) ---
-@app.head("/")
-@app.head("/health")
-@app.head("/healthz")
-async def health_head():
-    return Response(status_code=200)
+# ============================= SIGTERM лог =============================
+def _on_term(*_):
+    logger.warning("Got SIGTERM from platform. Graceful shutdown (redeploy/scale/change).")
+signal.signal(signal.SIGTERM, _on_term)
 
 @app.on_event("startup")
 async def on_startup():
@@ -67,6 +63,7 @@ async def on_startup():
     await init_db_pool()
 
     # Бот и диспетчер
+    from aiogram.client.default import DefaultBotProperties
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
@@ -82,7 +79,7 @@ async def on_startup():
         await set_chat_admin_commands(bot, ADMIN_CHAT_ID, "ru")
     await set_default_commands(bot)
 
-    # Регистрируем вебхук на свой Render-URL (аккуратная установка)
+    # Осторожно регистрируем вебхук на свой Render-URL
     info = await bot.get_webhook_info()
     if info.url != WEBHOOK_URL:
         await bot.set_webhook(
@@ -465,6 +462,41 @@ async def set_lang(user_id: int, lang: str):
             user_id, lang
         )
 
+# ============================= Утилиты для длинных сообщений =============================
+MAX_TG = 3900  # запас ниже лимита 4096
+
+async def safe_send_text(bot: Bot, chat_id: int, text: str, reply_markup=None):
+    if len(text) <= MAX_TG:
+        return await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    parts, cur, cur_len = [], [], 0
+    for line in text.splitlines():
+        seg = len(line) + 1
+        if cur_len + seg > MAX_TG:
+            parts.append("\n".join(cur))
+            cur, cur_len = [line], seg
+        else:
+            cur.append(line)
+            cur_len += seg
+    if cur:
+        parts.append("\n".join(cur))
+    msg = None
+    for i, chunk in enumerate(parts):
+        msg = await bot.send_message(chat_id, chunk, reply_markup=reply_markup if i == 0 else None)
+    return msg
+
+async def safe_edit_text(message: Message, text: str, reply_markup=None):
+    try:
+        if len(text) <= MAX_TG:
+            return await message.edit_text(text, reply_markup=reply_markup)
+        # слишком длинно для edit: отправим новое сообщение
+        await message.answer("⤵️ Продолжение:")
+        return await safe_send_text(message.bot, message.chat.id, text, reply_markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return
+        await message.answer("⤵️ Продолжение:")
+        return await safe_send_text(message.bot, message.chat.id, text, reply_markup)
+
 # ============================= Клавиатуры =============================
 def main_kb(lang: str, user_id: int | None = None, chat_id: int | None = None, chat_type: str | None = None) -> ReplyKeyboardMarkup:
     rows = [
@@ -552,25 +584,6 @@ def parse_guests_localized(value: str, lang: str) -> int:
     if not (1 <= n <= 30):
         raise ValueError(T(lang, "err_guests_range"))
     return n
-
-# ============================= Утилиты для безопасных сообщений =============================
-TG_LIMIT = 4096
-
-async def send_long_message(msg_or_bot, chat_id: int | None, text: str, **kwargs):
-    """
-    Если передан Message — используем .answer; если Bot — используем .send_message(chat_id).
-    Делим текст на чанки по 4096 символов.
-    """
-    s = text or ""
-    first = True
-    while s:
-        chunk = s[:TG_LIMIT]
-        s = s[TG_LIMIT:]
-        if hasattr(msg_or_bot, "answer"):
-            await msg_or_bot.answer(chunk, **(kwargs if first else {}))
-        else:
-            await msg_or_bot.send_message(chat_id, chunk, **(kwargs if first else {}))
-        first = False
 
 # ============================= Статусы =============================
 async def set_status(booking_id: int, new_status: str) -> tuple[int | None, int | None]:
@@ -922,23 +935,19 @@ async def ap_nop(cb: CallbackQuery):
 async def admin_panel(msg: Message):
     if not can_admin(msg.from_user.id, msg.chat.id, msg.chat.type):
         return
-    try:
-        lang = await get_lang(msg.from_user.id, "ru")
-        status = "all"
-        status_disp = {
-            "all": I18N[lang]["admin_filter_all"],
-            "new": I18N[lang]["admin_filter_new"],
-            "confirmed": I18N[lang]["admin_filter_confirmed"],
-            "cancelled": I18N[lang]["admin_filter_cancelled"],
-        }[status]
-        rows = await fetch_bookings(page=0, status=status)
-        header = T(lang, "admin_list_header", page=1, status_label=I18N[lang]["admin_status_label"], status=status_disp)
-        text = header + "\n\n" + ("\n".join([fmt_admin_booking_line(r, lang) for r in rows]) if rows else T(lang,"empty"))
-        await send_long_message(msg, None, text)
-        await msg.answer("🤗", reply_markup=main_kb(lang, msg.from_user.id, msg.chat.id, msg.chat.type))
-    except Exception as e:
-        logger.exception("admin_panel failed: %s", e)
-        await msg.answer("⚠️ Ошибка при формировании списка. Попробуйте ещё раз.")
+    lang = await get_lang(msg.from_user.id, "ru")
+    status = "all"
+    status_disp = {
+        "all": I18N[lang]["admin_filter_all"],
+        "new": I18N[lang]["admin_filter_new"],
+        "confirmed": I18N[lang]["admin_filter_confirmed"],
+        "cancelled": I18N[lang]["admin_filter_cancelled"],
+    }[status]
+    rows = await fetch_bookings(page=0, status=status)
+    header = T(lang, "admin_list_header", page=1, status_label=I18N[lang]["admin_status_label"], status=status_disp)
+    text = header + "\n\n" + ("\n".join([fmt_admin_booking_line(r, lang) for r in rows]) if rows else T(lang,"empty"))
+    await safe_send_text(msg.bot, msg.chat.id, text, reply_markup=admin_list_kb(0, status, lang))
+    await msg.answer("🤗", reply_markup=main_kb(lang, msg.from_user.id, msg.chat.id, msg.chat.type))
 
 @router.message(AdminDelete.waiting_for_id)
 async def ap_delete_waiting(msg: Message, state: FSMContext):
@@ -971,17 +980,8 @@ async def ap_page(cb: CallbackQuery):
     }.get(status, status)
     rows = await fetch_bookings(page=page, status=status)
     header = T(lang, "admin_list_header", page=page+1, status_label=I18N[lang]["admin_status_label"], status=status_disp)
-    lines = ("\n".join([fmt_admin_booking_line(r, lang) for r in rows]) if rows else T(lang, "empty"))
-    text = header + "\n\n" + lines
-    try:
-        if len(text) <= TG_LIMIT:
-            await cb.message.edit_text(text, reply_markup=admin_list_kb(page, status, lang))
-        else:
-            await cb.message.edit_text(header, reply_markup=admin_list_kb(page, status, lang))
-            await send_long_message(cb.message, None, lines)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e):
-            raise
+    text = header + "\n\n" + ("\n".join([fmt_admin_booking_line(r, lang) for r in rows]) if rows else T(lang, "empty"))
+    await safe_edit_text(cb.message, text, reply_markup=admin_list_kb(page, status, lang))
     await cb.answer()
 
 @router.callback_query(F.data.startswith("ap:set_status:"))
@@ -999,17 +999,8 @@ async def ap_set_status(cb: CallbackQuery):
     }.get(status, status)
     rows = await fetch_bookings(page=page, status=status)
     header = T(lang, "admin_list_header", page=page+1, status_label=I18N[lang]["admin_status_label"], status=status_disp)
-    lines = ("\n".join([fmt_admin_booking_line(r, lang) for r in rows]) if rows else T(lang, "empty"))
-    text = header + "\n\n" + lines
-    try:
-        if len(text) <= TG_LIMIT:
-            await cb.message.edit_text(text, reply_markup=admin_list_kb(page, status, lang))
-        else:
-            await cb.message.edit_text(header, reply_markup=admin_list_kb(page, status, lang))
-            await send_long_message(cb.message, None, lines)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e):
-            raise
+    text = header + "\n\n" + ("\n".join([fmt_admin_booking_line(r, lang) for r in rows]) if rows else T(lang, "empty"))
+    await safe_edit_text(cb.message, text, reply_markup=admin_list_kb(page, status, lang))
     await cb.answer(I18N[lang]["admin_status_label"] + " ✓")
 
 @router.callback_query(F.data.startswith("ap:confirm:"))
